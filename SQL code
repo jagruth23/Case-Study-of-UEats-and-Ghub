@@ -1,0 +1,146 @@
+CREATE TEMP FUNCTION parseHours(input STRING)
+RETURNS ARRAY<STRUCT<day STRING, start_time STRING, end_time STRING>>
+LANGUAGE js AS """
+try {
+  const parsed = JSON.parse(input);
+  const menus = parsed.data.menus || {};
+  const menuKey = Object.keys(menus)[0];
+  const menu = menus[menuKey];
+  const sections = menu.sections || [];
+  const section = sections[0] || {};
+  const regularHours = section.regularHours || [];
+  const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+  const result = [];
+  regularHours.forEach(hours => {
+    const daysBitArray = hours.daysBitArray || [];
+    const startTime = hours.startTime || null;
+    const endTime = hours.endTime || null;
+    for (let i = 0; i < days.length; i++) {
+      if (daysBitArray[i] === true) {
+        result.push({
+          day: days[i],
+          start_time: startTime,
+          end_time: endTime
+        });
+      }
+    }
+  });
+  return result;
+} catch (e) {
+  return [];
+}
+""";
+WITH parsed_hours AS (
+  SELECT
+    ue_slug,
+    vb_name,
+    b_name,
+    timestamp,
+    day_time.day AS day,
+    time(datetime(concat(CURRENT_DATE(), " ", day_time.start_time, ':00'))) AS start_time,
+    time(datetime(concat(CURRENT_DATE(), " ", day_time.end_time, ':00'))) AS end_time
+  FROM (
+    SELECT
+      slug AS ue_slug,
+      vb_name,
+      b_name,
+      timestamp,
+      ARRAY(SELECT AS STRUCT day, start_time, end_time FROM UNNEST(parseHours(TO_JSON_STRING(response)))) AS day_times
+    FROM (
+      SELECT * ,
+             ROW_NUMBER() OVER (PARTITION BY slug ORDER BY timestamp DESC) AS rn
+      FROM arboreal-vision-339901.take_home_v2.virtual_kitchen_ubereats_hours
+    )
+    WHERE rn = 1
+  ) CROSS JOIN UNNEST(day_times) AS day_time
+), deduplicated_base AS (
+  SELECT DISTINCT
+    slug,
+    timestamp,
+    vb_name,
+    b_name,
+    JSON_EXTRACT_SCALAR(value, '$.days_of_week[0]') AS day,
+    JSON_EXTRACT_SCALAR(value, '$.from') AS open_time,
+    JSON_EXTRACT_SCALAR(value, '$.to') AS close_time
+  FROM arboreal-vision-339901.take_home_v2.virtual_kitchen_grubhub_hours,
+  UNNEST(JSON_QUERY_ARRAY(response, '$.availability_by_catalog.STANDARD_DELIVERY.schedule_rules')) AS value
+), latest_timestamp AS (
+  SELECT slug, MAX(timestamp) AS latest_ts
+  FROM deduplicated_base
+  GROUP BY slug
+), daily_hours_calc AS (
+  SELECT
+    d.*
+  FROM deduplicated_base d
+  INNER JOIN latest_timestamp lt
+    ON d.slug = lt.slug
+    AND d.timestamp = lt.latest_ts
+), combined_hours AS (
+  SELECT
+    gru.slug AS Grubhub_slug,
+    ue.ue_slug AS Uber_Eats_slug,
+    gru.vb_name,
+    gru.b_name,
+    -- Combine Grubhub business hours for all days
+    STRING_AGG(CONCAT(gru.day, ': ', gru.open_time, '-', gru.close_time), '; ') AS Grubhub_Business_Hours,
+    -- Combine Uber Eats business hours for all days
+    STRING_AGG(CONCAT(ue.day, ': ', ue.start_time, '-', ue.end_time), '; ') AS Uber_Eats_Business_Hours,
+    -- Determine the overall status for is_out_range
+    CASE
+      WHEN COUNT(DISTINCT
+        CASE
+          WHEN LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60)
+          ) = 0
+          AND LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60)
+          ) = 0 THEN 'In Range'
+          WHEN LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60)
+          ) <= 5
+          AND LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60)
+          ) <= 5 THEN 'Out of Range with 5 mins difference'
+          ELSE 'Out of Range'
+        END
+      ) = 1 THEN ARRAY_AGG(DISTINCT
+        CASE
+          WHEN LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60)
+          ) = 0
+          AND LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60)
+          ) = 0 THEN 'In Range'
+          WHEN LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), ue.start_time)), TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.open_time AS TIME))), SECOND) / 60)
+          ) <= 5
+          AND LEAST(
+            ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60),
+            1440 - ABS(TIMESTAMP_DIFF(TIMESTAMP(DATETIME(CURRENT_DATE(), CAST(gru.close_time AS TIME))), TIMESTAMP(DATETIME(CURRENT_DATE(), ue.end_time)), SECOND) / 60)
+          ) <= 5 THEN 'Out of Range with 5 mins difference'
+          ELSE 'Out of Range'
+        END LIMIT 1
+      )[OFFSET(0)]
+    ELSE 'Mixed Statuses'
+    END AS is_out_range
+  FROM daily_hours_calc gru
+  INNER JOIN parsed_hours ue
+    ON gru.vb_name = ue.vb_name
+    AND gru.b_name = ue.b_name
+    AND LOWER(gru.day) = LOWER(ue.day)
+  GROUP BY gru.slug, ue.ue_slug, gru.vb_name, gru.b_name
+)
+SELECT
+  Grubhub_slug,
+  Grubhub_Business_Hours AS Virtual_Restaurant_Business_Hours,
+  Uber_Eats_slug,
+  Uber_Eats_Business_Hours,
+  is_out_range
+FROM combined_hours;
